@@ -10,6 +10,7 @@
   6. 并发争料：两个独立连接抢最后库存，恰好一个成功
   7. 质量换代：旧预览被拒、重新规划、旧确认保持来源
   8. 最大规模（12 批 / M=300 / 4 成分）性能与全枚举核对
+  9. 稀疏领料交叉表：部分退/全退计数 → 冻结切面 → 定向披露 → 拒绝后历史不变 → 关库重开
 """
 
 from __future__ import annotations
@@ -18,13 +19,21 @@ import threading
 from fractions import Fraction
 
 from blend.catalog import QualityCatalog
+from blend.classification import ClassificationStore
+from blend.disclosure import DisclosureOffice
 from blend.model import (
+    ClassificationGapError,
     ComponentConstraint,
     ConflictError,
+    DisclosureRejected,
     Order,
+    PlanResult,
+    PlannedLot,
     StalePreviewError,
+    StructuralZeroViolation,
 )
-from blend.planner import Planner, brute_force_best, evaluate_usage, explain_plan
+from blend.planner import Planner, brute_force_best, evaluate_usage, explain_plan, usage_cost
+from blend.slice import SliceOffice
 from blend.warehouse import Warehouse
 from tests.factories import make_lot, make_order
 
@@ -337,6 +346,185 @@ def demo_max_scale_and_brute_force() -> None:
     print("两者完全一致，最优性得到独立枚举确认。")
 
 
+# ---------------------------------------------------------------- 场景 9
+
+
+def _force_usage(wh: Warehouse, lots, order_id: str, usage: dict) -> None:
+    """用外部质量产品入口把指定整数用量落进履约仓（演示造数用）。"""
+    order = make_order(order_id, sum(usage.values()), {"c1": ("0", "1")}, max_lots=4)
+    by = {l.lot_id: l for l in lots}
+    product = evaluate_usage(lots, usage, source="demo-forced")
+    planned = tuple(
+        PlannedLot(lid, g, by[lid].step_g, by[lid].cost_per_g, by[lid].fixed_fee)
+        for lid, g in sorted(usage.items())
+    )
+    result = PlanResult(
+        order_id, order.total_g, planned, product,
+        usage_cost(usage, by), sum(1 for g in usage.values() if g), "demo-forced",
+    )
+    wh.confirm_preview(wh.preview_external(order, result))
+
+
+def demo_sparse_crosstab_disclosure() -> None:
+    section("场景 9｜稀疏领料交叉表：冻结切面 + 定向披露 + 历史合并 + 关库重开")
+    import tempfile
+    from pathlib import Path
+
+    tmp = tempfile.mkdtemp()
+    cat = QualityCatalog(":memory:")
+    # 3 个物料族（F1/F2/F3），每族两个 lot
+    lots = [
+        make_lot("L11", 100, {"c1": ("0", "1")}, cost_per_g=1),
+        make_lot("L12", 100, {"c1": ("0", "1")}, cost_per_g=1),
+        make_lot("L21", 100, {"c1": ("0", "1")}, cost_per_g=1),
+        make_lot("L22", 100, {"c1": ("0", "1")}, cost_per_g=1),
+        make_lot("L31", 100, {"c1": ("0", "1")}, cost_per_g=1),
+        make_lot("L32", 100, {"c1": ("0", "1")}, cost_per_g=1),
+    ]
+    cat.replace_lots(lots)
+    wh_path = Path(tmp) / "wh.db"
+    cls_path = Path(tmp) / "cls.db"
+    sl_path = Path(tmp) / "slice.db"
+    wh = Warehouse(wh_path, cat)
+    wh.register_lots(lots)
+
+    # ---- 真实领退：一次部分退料 + 一次全额退料 + 一次取消释放 ----------
+    # D1 行（多订单，故各格贡献者>=2 不保护）：
+    #   O1 在 F1 分两次领 4；O2 在 F1 领 3（F1 共两家、净 7）
+    _force_usage(wh, lots, "O1", {"L11": 4})
+    wh.issue("O1", "L11", 1); wh.issue("O1", "L11", 3)   # 同订单分两次领
+    _force_usage(wh, lots, "O2", {"L12": 3})
+    wh.issue("O2", "L12", 3)
+    #   O3 在 F2 领 7 后部分退回 2 -> 净 5；O4 在 F2 领 5
+    _force_usage(wh, lots, "O3", {"L21": 7})
+    wh.issue("O3", "L21", 7)
+    wh.return_material("O3", "L21", 2)                   # 部分退料
+    _force_usage(wh, lots, "O4", {"L22": 5})
+    wh.issue("O4", "L22", 5)
+    #   O5 在 F3 领 3；O6 在 F3 领 8 后全额退回 -> 净 0，退出贡献者；
+    #   O5b 在 F3 领 4，使该格由 O5、O5b 两家贡献（非保护），O6 全退不计
+    _force_usage(wh, lots, "O5", {"L31": 3})
+    wh.issue("O5", "L31", 3)
+    _force_usage(wh, lots, "O5B", {"L32": 4})
+    wh.issue("O5B", "L32", 4)
+    _force_usage(wh, lots, "O6", {"L31": 8})
+    wh.issue("O6", "L31", 8)
+    wh.return_material("O6", "L31", 8)                   # 全额退料
+    # D2/D3 行各格只有一家贡献者 => 主保护格
+    _force_usage(wh, lots, "O7", {"L11": 6, "L21": 2, "L31": 4})
+    wh.issue("O7", "L11", 6); wh.issue("O7", "L21", 2); wh.issue("O7", "L31", 4)
+    _force_usage(wh, lots, "O8", {"L12": 3, "L22": 7, "L32": 2})
+    wh.issue("O8", "L12", 3); wh.issue("O8", "L22", 7); wh.issue("O8", "L32", 2)
+    # O9 占料后取消，从未领出 => 不计入切面
+    _force_usage(wh, lots, "O9", {"L11": 9})
+    wh.cancel_order("O9")
+    print("领退事实（仅 ISSUE/RETURN）：")
+    for f in wh.issue_facts():
+        print(f"  #{f.ledger_id} {f.event:6} {f.order_id}/{f.lot_id} {f.signed_g:+d} g")
+
+    # ---- 分类：先演示缺口报错，再补全 -----------------------------------
+    cls = ClassificationStore(cls_path)
+    cls.replace_classification(
+        {"O1": "D1", "O2": "D1", "O3": "D1"},
+        {"L11": "F1", "L12": "F1", "L21": "F2"},
+    )
+    office = SliceOffice(sl_path)
+    try:
+        office.freeze_from(wh, cls, k=2)
+    except ClassificationGapError as exc:
+        print("分类不全被拦截，待分派订单：", exc.missing_orders,
+              "待分派 lot：", exc.missing_lots)
+    full_orders = {f"O{i}": ("D1" if i <= 6 else "D2" if i == 7 else "D3")
+                   for i in range(1, 9)}
+    full_orders["O5B"] = "D1"
+    full_orders["O9"] = "D3"
+    full_lots = {"L11": "F1", "L12": "F1", "L21": "F2", "L22": "F2",
+                 "L31": "F3", "L32": "F3"}
+    cls.replace_classification(full_orders, full_lots, note="全量分类 rev2")
+    # 结构性零冲突演示：声明 D3×F1 不可能，但 O8 在 L12(F1) 净领 3
+    try:
+        office.freeze_from(wh, cls, k=2, structural_zeros=[("D3", "F1")])
+    except StructuralZeroViolation as exc:
+        print("结构性零冲突被拦截：", exc.violating_cells)
+
+    # ---- 冻结切面（k=2，声明 D1×F3 之外无结构零；这里用一个真实空组合）----
+    # D1×F3 因 O6 全退而为普通零（不声明成结构性零）；声明 D2 无 F? 之外的
+    # 真实结构零：本例用 D3 与 F? 无冲突的清单，故传空，展示普通零 != 结构零。
+    sid = office.freeze_from(wh, cls, k=2, structural_zeros=(), note="季度切面")
+    sl = office.get_slice(sid)
+    print(f"\n冻结切面 slice_id={sid}，边界台账号 {sl.boundary_id}，"
+          f"分类 rev{sl.class_rev}，门槛 k={sl.k}")
+    print("内网精确矩阵（克数/贡献者数）：")
+    print("        " + "".join(f"{c:>10}" for c in sl.cols) + "    行合计")
+    for r in sl.rows:
+        cells = "".join(f"{sl.matrix[(r, c)]:>6}/{sl.contributors[(r, c)]:>2}"
+                        for c in sl.cols)
+        print(f"  {r:>5}{cells}    {sl.row_totals[r]}")
+    print("  列合计  " + "".join(f"{sl.col_totals[c]:>10}" for c in sl.cols))
+    print("主保护格（非空且贡献者<k）：", sorted(sl.protected))
+    print("D1×F3 有两家贡献者（O5、O5B），非保护格；O6 全退未计入：",
+          sl.matrix[("D1", "F3")] == 7 and sl.contributors[("D1", "F3")] == 2
+          and ("D1", "F3") not in sl.protected)
+    print("对外固定公开（无格内克数/人数）：", office.public_view(sid))
+
+    # ---- 定向披露 -------------------------------------------------------
+    dl = DisclosureOffice(office)
+    print("\n定向发布：")
+    # 必选非保护格 D1×F2=10（O3 净5 + O4 的5，两家贡献者）
+    dry = dl.check_request(sid, "甲", required=[("D1", "F2")])
+    print("  甲请求 D1×F2 干跑结论：", "安全" if dry["accepted"] else dry["reason"])
+    out = dl.request_disclosure(sid, "甲", required=[("D1", "F2")])
+    print("  甲获准：", {f"{r}×{c}": g for (r, c), g in out.granted_values.items()})
+
+    # 追加另一个非保护格 D1×F3（两家贡献者），在 3x3 自由度下仍安全
+    out2 = dl.request_disclosure(sid, "甲", required=[("D1", "F3")])
+    print("  甲追加 D1×F3 获准：",
+          {f"{r}×{c}": g for (r, c), g in out2.granted_values.items()
+           if (r, c) == ("D1", "F3")})
+
+    # 点名主保护格 -> 拒绝且历史不变
+    protected_sample = next(iter(sl.protected))
+    try:
+        dl.request_disclosure(sid, "甲", optional=[(protected_sample, 9)])
+    except DisclosureRejected as exc:
+        print(f"  甲点名主保护格 {protected_sample} 被拒：", exc.reason)
+    print("  拒绝后甲的历史不变：", dl.granted_cells(sid, "甲"))
+
+    # 已公开格重复请求不计价值
+    r = dl.check_request(sid, "甲", optional=[(("D1", "F2"), 5)])
+    print("  已公开格重复请求：新增价值 =", r["optional_value"], "，跳过", r["skipped"])
+
+    # 新客户乙：独立历史，同一切面从零开始
+    out_b = dl.request_disclosure(sid, "乙", required=[("D1", "F2")])
+    print("  乙独立获准：", {f"{r}×{c}": g for (r, c), g in out_b.granted_values.items()})
+    print("  请求审计日志：",
+          [(x["customer"], x["accepted"], x["reason"]) for x in dl.request_log(sid)])
+    print("  甲对外视图（只含合计与获准值，无人数/被盖原值）：")
+    print("   ", dl.customer_view(sid, "甲"))
+
+    # ---- 关库重开：冻结矩阵与披露历史都保持，新领退不改旧切面 -----------
+    wh.close(); cls.close(); office.close(); dl.close(); cat.close()
+    wh2 = Warehouse(wh_path, QualityCatalog(":memory:"))
+    cls2 = ClassificationStore(cls_path)
+    office2 = SliceOffice(sl_path)
+    dl2 = DisclosureOffice(office2)
+    sl_reopen = office2.get_slice(sid)
+    print("\n关库重开后：")
+    print("  冻结矩阵保持：", dict(sl_reopen.matrix))
+    print("  甲历史保持：", dl2.granted_cells(sid, "甲"))
+    print("  乙历史保持：", dl2.granted_cells(sid, "乙"))
+    before = dict(sl_reopen.matrix)
+    _force_usage(wh2, lots, "O10", {"L32": 11})
+    wh2.issue("O10", "L32", 11)
+    full_orders["O10"] = "D2"
+    cls2.replace_classification(full_orders, full_lots)
+    assert dict(office2.get_slice(sid).matrix) == before, "旧切面必须不变"
+    sid_new = office2.freeze_from(wh2, cls2, k=2, structural_zeros=())
+    print("  新领退后旧切面不变；新切面", sid_new, "矩阵：",
+          dict(office2.get_slice(sid_new).matrix))
+    wh2.close(); cls2.close(); office2.close(); dl2.close()
+
+
 def main() -> None:
     demo_catalog_product()
     demo_midpoint_vs_robust()
@@ -346,6 +534,7 @@ def main() -> None:
     demo_concurrent_race()
     demo_quality_generation()
     demo_max_scale_and_brute_force()
+    demo_sparse_crosstab_disclosure()
     print("\n全部演示场景完成。")
 
 

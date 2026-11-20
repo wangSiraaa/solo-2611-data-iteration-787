@@ -17,6 +17,9 @@ __all__ = [
     "StalePreviewError",
     "ConflictError",
     "StateError",
+    "ClassificationGapError",
+    "StructuralZeroViolation",
+    "DisclosureRejected",
     "Lot",
     "ComponentConstraint",
     "Order",
@@ -52,6 +55,49 @@ class ConflictError(BlendError):
 
 class StateError(BlendError):
     """操作与单据当前状态不符（重复确认、取消后再领料等）。"""
+
+
+class ClassificationGapError(BlendError):
+    """切面边界内的 ISSUE/RETURN 事实引用了分类修订未覆盖的订单或 lot。
+
+    严禁静默丢弃未分类对象后发布：调用方必须补全分类修订再重新冻结。
+    """
+
+    def __init__(self, missing_orders, missing_lots, rev) -> None:
+        self.missing_orders = tuple(sorted(missing_orders))
+        self.missing_lots = tuple(sorted(missing_lots))
+        self.rev = rev
+        super().__init__(
+            f"分类修订 rev{rev} 不完整：未分派订单 {self.missing_orders}、"
+            f"未分派 lot {self.missing_lots}；请补全分类后再冻结切面，"
+            "禁止静默删除相关事实后发布"
+        )
+
+
+class StructuralZeroViolation(BlendError):
+    """有净领克数落在显式业务清单声明的结构性不可能组合上，切面生成失败。"""
+
+    def __init__(self, violating_cells) -> None:
+        self.violating_cells = tuple(sorted(violating_cells))
+        super().__init__(
+            "以下结构性不可能组合出现了正净领克数，切面生成失败: "
+            + ", ".join(f"({r},{c})" for r, c in self.violating_cells)
+        )
+
+
+class DisclosureRejected(BlendError):
+    """披露请求被整次拒绝（历史不写入任何新值）。
+
+    ``reason`` 取值：
+
+    * ``protected_cell_named`` —— 请求点名了主保护格，主保护格不得公开；
+    * ``unsafe`` —— 必选格/既有历史/固定合计已使某主保护格只有唯一可能值。
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"披露请求被拒绝（{reason}）{('：' + detail) if detail else ''}")
 
 
 # --------------------------------------------------------------- 有理数工具

@@ -43,7 +43,7 @@ from .model import (
 )
 from .planner import Planner, active_count, usage_cost
 
-__all__ = ["Warehouse", "OrderView", "AllocationView", "LedgerEntry"]
+__all__ = ["Warehouse", "OrderView", "AllocationView", "LedgerEntry", "IssueFact"]
 
 # allocation 状态
 ST_PENDING = "PENDING"
@@ -199,6 +199,23 @@ class OrderView:
     plan: dict
     allocations: tuple[AllocationView, ...]
     ledger: tuple[LedgerEntry, ...]
+
+
+@dataclass(frozen=True)
+class IssueFact:
+    """截至某边界的一条真实领料/退回事实（冻结切面的唯一输入）。
+
+    * ``ledger_id``  台账自增号，同时充当切面固定的源事件边界；
+    * ``signed_g``   ISSUE 为正、RETURN 为负，均为非零整数克数；
+    * CONFIRM/CANCEL_RELEASE 不是实际领退，不出现在本视图里。
+    """
+
+    ledger_id: int
+    order_id: str
+    lot_id: str
+    event: str
+    signed_g: int
+    created_at: str
 
 
 # ------------------------------------------------------------ 仓库主体
@@ -655,6 +672,34 @@ class Warehouse:
         return [r[0] for r in self._conn.execute(
             "SELECT order_id FROM wh_orders ORDER BY order_id"
         ).fetchall()]
+
+    # ======================================================== 领退事实只读视图
+    def max_ledger_id(self) -> int:
+        """当前台账最大事件号；空台账返回 0。冻结切面以此固定源事件边界。"""
+        row = self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM wh_ledger").fetchone()
+        return int(row[0])
+
+    def issue_facts(self, boundary_id: int | None = None) -> tuple[IssueFact, ...]:
+        """只读导出截至边界（含）的真实 ISSUE/RETURN 事实，按台账号升序。
+
+        CONFIRM 只是占料、CANCEL_RELEASE 只释放未领份额，均非实际领退，
+        不在导出范围内；切面模块只能消费本视图，不直接触碰业务表。
+        ``boundary_id=None`` 表示取当前全部事实（边界 = 最大台账号）。
+        """
+        if boundary_id is None:
+            boundary_id = self.max_ledger_id()
+        if not isinstance(boundary_id, int) or boundary_id < 0:
+            raise ValidationError("事件边界必须是非负整数")
+        rows = self._conn.execute(
+            "SELECT id, order_id, lot_id, event, grams, created_at FROM wh_ledger"
+            " WHERE event IN ('ISSUE','RETURN') AND id <= ? ORDER BY id",
+            (boundary_id,),
+        ).fetchall()
+        out: list[IssueFact] = []
+        for ledger_id, order_id, lot_id, event, grams, created_at in rows:
+            signed = grams if event == "ISSUE" else -grams
+            out.append(IssueFact(ledger_id, order_id, lot_id, event, signed, created_at))
+        return tuple(out)
 
     def explain_order(self, order_id: str) -> str:
         """解释入口：来源修订、质量边界、占用/领料/退回/取消全台账。"""
